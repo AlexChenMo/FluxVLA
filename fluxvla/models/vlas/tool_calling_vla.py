@@ -11,7 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""OpenAI Responses API policy for checkpoint-free robot evaluation."""
+"""Provider-independent tool-calling policies for robot evaluation.
+
+Observation history and normalized replies use Responses-shaped dictionaries
+internally. Provider subclasses own wire-format conversion, authentication and
+HTTP transport; these shared policies only interpret tools and produce actions.
+"""
 
 from __future__ import annotations
 import base64
@@ -19,10 +24,7 @@ import copy
 import io
 import json
 import math
-import os
 import time
-import urllib.error
-import urllib.request
 from numbers import Real
 from typing import Any, Dict, List, Sequence
 
@@ -31,7 +33,7 @@ import torch
 import torch.nn as nn
 from PIL import Image
 
-from fluxvla.engines import VLAS, initialize_overwatch
+from fluxvla.engines import initialize_overwatch
 
 overwatch = initialize_overwatch(__name__)
 
@@ -96,9 +98,8 @@ Use only the camera images and reported robot state; do not assume hidden
 simulator metadata."""
 
 
-@VLAS.register_module()
-class OpenAIResponsesVLA(nn.Module):
-    """Inference-only VLA backed by the OpenAI Responses API.
+class ToolCallingVLA(nn.Module):
+    """Shared inference-only LIBERO policy driven by tool calls.
 
     The model emits a high-level absolute Cartesian ``move_to`` tool call.
     This wrapper converts that target into a short chunk of normalized LIBERO
@@ -106,9 +107,9 @@ class OpenAIResponsesVLA(nn.Module):
     """
 
     def __init__(self,
-                 model: str = 'gpt-6-astra',
-                 base_url: str = 'https://api.openai.com/v1',
-                 api_key_env: str = 'OPENAI_API_KEY',
+                 model: str,
+                 base_url: str,
+                 api_key_env: str,
                  reasoning_effort: str = 'medium',
                  max_output_tokens: int = None,
                  request_timeout: float = 120.0,
@@ -277,7 +278,7 @@ class OpenAIResponsesVLA(nn.Module):
         }]
 
     def forward(self, *args, **kwargs):
-        raise RuntimeError('OpenAIResponsesVLA is inference-only.')
+        raise RuntimeError(f'{type(self).__name__} is inference-only.')
 
     def get_fsdp_wrapping_policy(self):
         return None
@@ -442,53 +443,12 @@ class OpenAIResponsesVLA(nn.Module):
         return history
 
     def _request_body(self) -> Dict[str, Any]:
-        body = {
-            'model': self.model,
-            'input': self._compact_history(),
-            'tools': self.tools,
-            'tool_choice': 'required',
-            'parallel_tool_calls': False,
-        }
-        if self.reasoning_effort is not None:
-            body['reasoning'] = {'effort': self.reasoning_effort}
-        if self.max_output_tokens is not None:
-            body['max_output_tokens'] = self.max_output_tokens
-        return body
+        """Encode the current observation history for the provider API."""
+        raise NotImplementedError('The provider must implement _request_body.')
 
     def _post_json(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        api_key = os.environ.get(self.api_key_env)
-        if not api_key:
-            raise RuntimeError(
-                f'Missing OpenAI API key in environment variable '
-                f'{self.api_key_env!r}.')
-
-        request = urllib.request.Request(
-            f'{self.base_url}/responses',
-            data=json.dumps(body).encode('utf-8'),
-            headers={
-                'Authorization': f'Bearer {api_key}',
-                'Content-Type': 'application/json',
-                'User-Agent': 'FluxVLA/OpenAIResponsesVLA',
-            },
-            method='POST')
-        for attempt in range(self.max_retries + 1):
-            try:
-                with urllib.request.urlopen(
-                        request, timeout=self.request_timeout) as response:
-                    return json.loads(response.read().decode('utf-8'))
-            except urllib.error.HTTPError as exc:
-                error_body = exc.read().decode('utf-8', errors='replace')
-                retryable = exc.code == 429 or 500 <= exc.code < 600
-                if not retryable or attempt >= self.max_retries:
-                    raise RuntimeError(
-                        f'OpenAI Responses API returned HTTP {exc.code}: '
-                        f'{error_body[:1000]}') from exc
-            except (urllib.error.URLError, TimeoutError) as exc:
-                if attempt >= self.max_retries:
-                    raise RuntimeError(
-                        f'OpenAI Responses API request failed: {exc}') from exc
-            time.sleep(self.retry_backoff * (2**attempt))
-        raise AssertionError('unreachable')
+        """Send a request and return normalized function_call output items."""
+        raise NotImplementedError('The provider must implement _post_json.')
 
     @staticmethod
     def _function_call(response: Dict[str, Any]) -> Dict[str, Any]:
@@ -502,9 +462,8 @@ class OpenAIResponsesVLA(nn.Module):
                 item.get('type') for item in response.get('output', [])
             ]
             raise RuntimeError(
-                'Expected exactly one move_to tool call from the OpenAI '
-                f'Responses API, got {len(calls)}; output types={output_types}'
-            )
+                'Expected exactly one move_to tool call from the API, '
+                f'got {len(calls)}; output types={output_types}')
         return calls[0]
 
     @classmethod
@@ -624,7 +583,8 @@ class OpenAIResponsesVLA(nn.Module):
         if self._llm_calls >= self.max_llm_calls:
             if not self._budget_warning_emitted:
                 overwatch.warning(
-                    f'OpenAI call budget ({self.max_llm_calls}) exhausted; '
+                    f'{self.model} call budget '
+                    f'({self.max_llm_calls}) exhausted; '
                     'returning hold actions for the rest of the episode.')
                 self._budget_warning_emitted = True
             return self._hold_actions()
@@ -662,8 +622,9 @@ class OpenAIResponsesVLA(nn.Module):
             'input_tokens': usage.get('input_tokens'),
             'output_tokens': usage.get('output_tokens'),
         }
-        overwatch.info(f'GPT action {self._llm_calls}/{self.max_llm_calls}: '
-                       f'{targets} | {self.last_note}')
+        overwatch.info(
+            f'{self.model} action {self._llm_calls}/{self.max_llm_calls}: '
+            f'{targets} | {self.last_note}')
 
         call_id = call.get('call_id')
         self._history.append({
@@ -684,9 +645,8 @@ class OpenAIResponsesVLA(nn.Module):
         return actions
 
 
-@VLAS.register_module()
-class OpenAIResponsesRobocasaVLA(OpenAIResponsesVLA):
-    """Checkpoint-free Responses API policy for RoboCasa GR1 evaluation.
+class ToolCallingRobocasaVLA(ToolCallingVLA):
+    """Shared tool-calling policy for RoboCasa GR1 evaluation.
 
     The API emits bounded joint deltas plus discrete hand commands. They are
     converted to native, absolute GR1 controller targets in N1.5 order:
@@ -699,9 +659,9 @@ class OpenAIResponsesRobocasaVLA(OpenAIResponsesVLA):
                                  dtype=np.float32)
 
     def __init__(self,
-                 model: str = 'gpt-6-astra',
-                 base_url: str = 'https://api.openai.com/v1',
-                 api_key_env: str = 'OPENAI_API_KEY',
+                 model: str,
+                 base_url: str,
+                 api_key_env: str,
                  reasoning_effort: str = 'medium',
                  max_output_tokens: int = None,
                  request_timeout: float = 120.0,
@@ -848,8 +808,8 @@ class OpenAIResponsesRobocasaVLA(OpenAIResponsesVLA):
                      max_delta: float, bounds) -> np.ndarray:
         if key not in command:
             return current.copy()
-        delta = OpenAIResponsesRobocasaVLA._joint_vector(
-            command[key], current.shape[0], key)
+        delta = ToolCallingRobocasaVLA._joint_vector(command[key],
+                                                     current.shape[0], key)
         target = current + np.clip(delta, -max_delta, max_delta)
         bounds_array = np.asarray(bounds, dtype=np.float64)
         if bounds_array.ndim == 1:
@@ -923,9 +883,8 @@ class OpenAIResponsesRobocasaVLA(OpenAIResponsesVLA):
                 item.get('type') for item in response.get('output', [])
             ]
             raise RuntimeError(
-                'Expected exactly one control_gr1 tool call from the OpenAI '
-                f'Responses API, got {len(calls)}; output types={output_types}'
-            )
+                'Expected exactly one control_gr1 tool call from the API, '
+                f'got {len(calls)}; output types={output_types}')
         return calls[0]
 
     def _robocasa_actions(self, command: Dict[str, Any], left_arm: Any,
@@ -990,7 +949,8 @@ class OpenAIResponsesRobocasaVLA(OpenAIResponsesVLA):
         if self._llm_calls >= self.max_llm_calls:
             if not self._budget_warning_emitted:
                 overwatch.warning(
-                    f'OpenAI call budget ({self.max_llm_calls}) exhausted; '
+                    f'{self.model} call budget '
+                    f'({self.max_llm_calls}) exhausted; '
                     'returning GR1 hold actions for the rest of the episode.')
                 self._budget_warning_emitted = True
             return self._hold_robocasa_actions(left_arm, right_arm, waist)
@@ -1025,9 +985,9 @@ class OpenAIResponsesRobocasaVLA(OpenAIResponsesVLA):
             key: value
             for key, value in command.items() if key != 'note'
         }
-        overwatch.info(
-            f'GPT RoboCasa action {self._llm_calls}/{self.max_llm_calls}: '
-            f'{logged_command} | {self.last_note}')
+        overwatch.info(f'{self.model} RoboCasa action '
+                       f'{self._llm_calls}/{self.max_llm_calls}: '
+                       f'{logged_command} | {self.last_note}')
 
         call_id = call.get('call_id')
         self._history.append({

@@ -32,8 +32,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
 from fluxvla.engines import VLAS
-from .openai_responses_vla import (OpenAIResponsesRobocasaVLA,
-                                   OpenAIResponsesVLA)
+from .tool_calling_vla import ToolCallingRobocasaVLA, ToolCallingVLA
 
 DEFAULT_MINIMAX_MODEL = 'MiniMax-M3.1-Flash'
 # Keys are issued per platform, so each region reads its own variable and
@@ -61,7 +60,7 @@ _RETRYABLE_STATUS_CODES = (1001, 1002, 1013)
 
 
 class MiniMaxProtocolMixin:
-    """Serve an :class:`OpenAIResponsesVLA` policy over MiniMax protocols.
+    """Serve an :class:`ToolCallingVLA` policy over MiniMax protocols.
 
     The policy history stays in Responses format, so observation building,
     image compaction, tool-call validation and action conversion are all
@@ -192,10 +191,17 @@ class MiniMaxProtocolMixin:
         return self._anthropic_body(history)
 
     def _responses_body(self) -> Dict[str, Any]:
-        body = super()._request_body()
-        # MiniMax ignores parallel_tool_calls and only accepts 'auto'.
-        body.pop('parallel_tool_calls', None)
-        body['tool_choice'] = 'auto'
+        # Keep provider-specific options out of the shared robot policy.
+        body = {
+            'model': self.model,
+            'input': self._compact_history(),
+            'tools': self.tools,
+            'tool_choice': 'auto',
+        }
+        if self.reasoning_effort is not None:
+            body['reasoning'] = {'effort': self.reasoning_effort}
+        if self.max_output_tokens is not None:
+            body['max_output_tokens'] = self.max_output_tokens
         items = []
         for item in body['input']:
             turn = (
@@ -463,6 +469,9 @@ class MiniMaxProtocolMixin:
             raise RuntimeError(
                 'MiniMax withheld the reply (content_filter) before '
                 'emitting a tool call.')
+        raise RuntimeError(
+            f'MiniMax returned no tool call (stop_reason={reason!r}); '
+            'no action was executed.')
 
     def _store_turn(self, output: List[Dict[str, Any]], turn: Any) -> None:
         for item in output:
@@ -536,18 +545,18 @@ class MiniMaxProtocolMixin:
 
 
 @VLAS.register_module()
-class MiniMaxLiberoVLA(MiniMaxProtocolMixin, OpenAIResponsesVLA):
+class MiniMaxLiberoVLA(MiniMaxProtocolMixin, ToolCallingVLA):
     """Checkpoint-free MiniMax policy emitting LIBERO ``move_to`` calls.
 
-    Accepts every :class:`OpenAIResponsesVLA` argument plus the protocol
+    Accepts every :class:`ToolCallingVLA` argument plus the protocol
     options of :class:`MiniMaxProtocolMixin`.
     """
 
 
 @VLAS.register_module()
-class MiniMaxRobocasaVLA(MiniMaxProtocolMixin, OpenAIResponsesRobocasaVLA):
+class MiniMaxRobocasaVLA(MiniMaxProtocolMixin, ToolCallingRobocasaVLA):
     """Checkpoint-free MiniMax policy emitting RoboCasa ``control_gr1`` calls.
 
-    Accepts every :class:`OpenAIResponsesRobocasaVLA` argument plus the
+    Accepts every :class:`ToolCallingRobocasaVLA` argument plus the
     protocol options of :class:`MiniMaxProtocolMixin`.
     """
