@@ -26,7 +26,7 @@ import json
 import math
 import time
 from numbers import Real
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -198,6 +198,7 @@ class ToolCallingVLA(nn.Module):
         self._llm_calls = 0
         self._last_gripper_action = -1.0
         self._budget_warning_emitted = False
+        self._action_generation_stopped = False
 
     @property
     def tools(self) -> List[Dict[str, Any]]:
@@ -296,6 +297,7 @@ class ToolCallingVLA(nn.Module):
         self.last_note = ''
         self.last_response_metadata = {}
         self._budget_warning_emitted = False
+        self._action_generation_stopped = False
         goal_content = f'Goal: {task_description}'
         visual_hint = self.task_visual_hints.get(
             task_description.strip().lower())
@@ -446,8 +448,12 @@ class ToolCallingVLA(nn.Module):
         """Encode the current observation history for the provider API."""
         raise NotImplementedError('The provider must implement _request_body.')
 
-    def _post_json(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        """Send a request and return normalized function_call output items."""
+    def _post_json(self, body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Return normalized calls, or stop action generation and return None.
+
+        Providers may explicitly set ``_action_generation_stopped`` to keep
+        holding until this episode ends. Other missing calls remain errors.
+        """
         raise NotImplementedError('The provider must implement _post_json.')
 
     @staticmethod
@@ -580,6 +586,9 @@ class ToolCallingVLA(nn.Module):
               and isinstance(image_names[0], (list, tuple))):
             image_names = image_names[0]
 
+        if self._action_generation_stopped:
+            return self._hold_actions()
+
         if self._llm_calls >= self.max_llm_calls:
             if not self._budget_warning_emitted:
                 overwatch.warning(
@@ -597,6 +606,8 @@ class ToolCallingVLA(nn.Module):
         start = time.monotonic()
         response = self._post_json(self._request_body())
         latency = time.monotonic() - start
+        if self._action_generation_stopped:
+            return self._hold_actions()
         self._llm_calls += 1
         call = self._function_call(response)
         try:
@@ -946,6 +957,9 @@ class ToolCallingRobocasaVLA(ToolCallingVLA):
               and isinstance(image_names[0], (list, tuple))):
             image_names = image_names[0]
 
+        if self._action_generation_stopped:
+            return self._hold_robocasa_actions(left_arm, right_arm, waist)
+
         if self._llm_calls >= self.max_llm_calls:
             if not self._budget_warning_emitted:
                 overwatch.warning(
@@ -963,6 +977,8 @@ class ToolCallingRobocasaVLA(ToolCallingVLA):
         start = time.monotonic()
         response = self._post_json(self._request_body())
         latency = time.monotonic() - start
+        if self._action_generation_stopped:
+            return self._hold_robocasa_actions(left_arm, right_arm, waist)
         self._llm_calls += 1
         call = self._robocasa_function_call(response)
         try:

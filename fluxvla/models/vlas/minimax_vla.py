@@ -23,6 +23,7 @@ platforms:
 """
 
 from __future__ import annotations
+import copy
 import json
 import os
 import time
@@ -31,8 +32,10 @@ import urllib.request
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
-from fluxvla.engines import VLAS
+from fluxvla.engines import VLAS, initialize_overwatch
 from .tool_calling_vla import ToolCallingRobocasaVLA, ToolCallingVLA
+
+overwatch = initialize_overwatch(__name__)
 
 DEFAULT_MINIMAX_MODEL = 'MiniMax-M3.1-Flash'
 # Keys are issued per platform, so each region reads its own variable and
@@ -84,8 +87,11 @@ class MiniMaxProtocolMixin:
             ``base_url`` serves the two OpenAI-compatible protocols.
         tool_choice (str): ``'auto'`` is the only value the Messages and
             Responses APIs accept; the system prompt already demands exactly
-            one tool call, and a reply without one fails the inherited
-            validation instead of silently holding. ``'required'`` is sent
+            one tool call. Messages gets one corrective retry for an
+            ``end_turn`` without a tool call, within ``max_llm_calls``;
+            persistent failure explicitly stops further API calls for this
+            episode and holds until the environment ends it.
+            ``'required'`` is sent
             only over Chat Completions, whose reference does not document
             ``tool_choice``; ``'auto'`` omits the field there.
         replay_assistant_turns (bool): Replay raw assistant turns. Disable
@@ -388,7 +394,7 @@ class MiniMaxProtocolMixin:
 
     # ---- Transport and response normalization ---------------------------
 
-    def _post_json(self, body: Dict[str, Any]) -> Dict[str, Any]:
+    def _post_json(self, body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         api_key = os.environ.get(self.api_key_env)
         if not api_key:
             raise RuntimeError(
@@ -400,8 +406,62 @@ class MiniMaxProtocolMixin:
             'User-Agent': f'FluxVLA/{type(self).__name__}',
         }
         if self.api_protocol == 'anthropic':
-            raw = self._http_post(f'{self.anthropic_base_url}/v1/messages',
-                                  headers, body, 'MiniMax Messages API')
+            start = time.monotonic()
+            for attempt in range(2):
+                raw = self._http_post(f'{self.anthropic_base_url}/v1/messages',
+                                      headers, body, 'MiniMax Messages API')
+                self._raise_api_error(raw)
+                blocks = raw.get('content') or []
+                if raw.get('stop_reason') != 'end_turn' or any(
+                        block.get('type') == 'tool_use' for block in blocks):
+                    break
+                # predict_action counts the successful reply. Count each
+                # discarded reply here so repair cannot exceed its budget.
+                self._llm_calls += 1
+                retry = attempt == 0 and self._llm_calls < self.max_llm_calls
+                reply_text = ' '.join(
+                    block.get('text', '') for block in blocks
+                    if block.get('type') == 'text')[:400]
+                overwatch.warning(
+                    f'MiniMax end_turn without a tool call; '
+                    f'id={raw.get("id")!r}, retry={retry}, '
+                    f'calls={self._llm_calls}/{self.max_llm_calls}, '
+                    f'text={reply_text!r}')
+                if not retry:
+                    self._action_generation_stopped = True
+                    usage = raw.get('usage') or {}
+                    self.last_response_metadata = {
+                        'id': raw.get('id'),
+                        'model': raw.get('model', self.model),
+                        'latency_seconds': time.monotonic() - start,
+                        'input_tokens': usage.get('input_tokens'),
+                        'output_tokens': usage.get('output_tokens'),
+                        'stop_reason': 'missing_tool_call',
+                        'api_stop_reason': raw.get('stop_reason'),
+                        'policy_calls': self._llm_calls,
+                        'response_text': reply_text,
+                    }
+                    self.last_note = (
+                        'MiniMax returned no tool call; stopping API calls '
+                        'for this episode and holding the previous control '
+                        'state until the environment ends it. No tool call '
+                        'or task success was fabricated.')
+                    overwatch.warning(self.last_note)
+                    return None
+                # Re-request the unchanged observation with a reminder, not
+                # a fabricated tool result or an action parsed from prose.
+                body = copy.deepcopy(body)
+                body['messages'][-1]['content'].append({
+                    'type':
+                    'text',
+                    'text':
+                    ('No tool call was returned and no action was '
+                     'executed. The simulator has not ended this episode. '
+                     f'Use exactly one {self.tools[0]["name"]} tool call '
+                     'for your next action; put explanations in its note '
+                     f'field. API calls used: {self._llm_calls}/'
+                     f'{self.max_llm_calls}.'),
+                })
             return self._normalize_anthropic(raw)
         if self.api_protocol == 'chat_completions':
             raw = self._http_post(f'{self.base_url}/chat/completions', headers,
