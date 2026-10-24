@@ -28,8 +28,7 @@ from mmengine import Config
 from fluxvla.engines import build_vla_from_cfg
 from fluxvla.models.vlas.minimax_vla import (MiniMaxLiberoVLA,
                                              MiniMaxRobocasaVLA)
-from fluxvla.models.vlas.openai_responses_vla import (
-    OpenAIResponsesRobocasaVLA, OpenAIResponsesVLA)
+from fluxvla.models.vlas.openai_vla import OpenAILiberoVLA, OpenAIRobocasaVLA
 
 ROOT = Path(__file__).resolve().parents[2]
 PROTOCOLS = ('anthropic', 'chat_completions', 'responses')
@@ -253,8 +252,8 @@ def test_libero_actions_match_openai_responses_policy(monkeypatch, protocol):
     model = MiniMaxLiberoVLA(api_protocol=protocol)
     _, actions = run_minimax(monkeypatch, model, 'move_to', MOVES,
                              libero_inputs)
-    expected = run_reference(monkeypatch, OpenAIResponsesVLA(), 'move_to',
-                             MOVES, libero_inputs)
+    expected = run_reference(monkeypatch, OpenAILiberoVLA(), 'move_to', MOVES,
+                             libero_inputs)
 
     for got, want in zip(actions, expected):
         assert got.dtype == torch.float32
@@ -441,6 +440,270 @@ def test_new_episode_drops_stored_assistant_turns(monkeypatch):
     assert model._assistant_turns
     model._reset_episode('another task')
     assert model._assistant_turns == {}
+
+
+@pytest.mark.parametrize('content', [[],
+                                     [
+                                         {
+                                             'type': 'thinking',
+                                             'thinking': 'planning',
+                                             'signature': 's'
+                                         },
+                                         {
+                                             'type': 'text',
+                                             'text': 'Moving now.'
+                                         },
+                                     ]])
+def test_reply_without_action_stops_generation_after_one_retry(
+        monkeypatch, content):
+    monkeypatch.setenv('MINIMAX_CN_API_KEY', 'test-key')
+    model = MiniMaxLiberoVLA()
+    reply = {'content': content, 'stop_reason': 'end_turn'}
+    transport = FakeTransport([reply, reply])
+    monkeypatch.setattr(model, '_http_post', transport)
+    actions = model.predict_action(**libero_inputs(0))
+    torch.testing.assert_close(actions, model._hold_actions())
+    assert len(transport.requests) == 2
+    assert model._llm_calls == 2
+    assert model._action_generation_stopped
+    assert model.last_response_metadata['stop_reason'] == 'missing_tool_call'
+    assert model._assistant_turns == {}
+    assert all(item.get('type') != 'function_call' for item in model._history)
+    history = copy.deepcopy(model._history)
+    for step in range(1, 10):
+        torch.testing.assert_close(
+            model.predict_action(**libero_inputs(step)), actions)
+    assert len(transport.requests) == 2
+    assert model._llm_calls == 2  # Do not pretend the budget was exhausted.
+    assert model._history == history
+
+
+@pytest.mark.parametrize('cls, tool, commands, inputs_fn', [
+    (MiniMaxLiberoVLA, 'move_to', MOVES, libero_inputs),
+    (MiniMaxRobocasaVLA, 'control_gr1', GR1_COMMANDS, robocasa_inputs),
+])
+def test_end_turn_recovery_preserves_actions_and_history(
+        monkeypatch, cls, tool, commands, inputs_fn):
+    model = cls(max_llm_calls=3)
+    monkeypatch.setenv(model.api_key_env, 'test-key')
+    replies = [
+        native_reply('anthropic', f'call_{index}', tool, command)
+        for index, command in enumerate(commands)
+    ]
+    transport = FakeTransport([{
+        'content': [{
+            'type': 'text',
+            'text': 'Moving now.'
+        }],
+        'stop_reason':
+        'end_turn',
+    }, *replies])
+    monkeypatch.setattr(model, '_http_post', transport)
+    first = model.predict_action(**inputs_fn(0))
+    assert model._llm_calls == 2
+    second = model.predict_action(**inputs_fn(1))
+    assert model._llm_calls == 3
+    assert len(transport.requests) == 3
+    reference = cls(max_llm_calls=3)
+    _, expected = run_minimax(monkeypatch, reference, tool, commands,
+                              inputs_fn)
+    for actual, want in zip((first, second), expected):
+        torch.testing.assert_close(actual, want, rtol=0, atol=0)
+    original = transport.requests[0]['body']
+    repair = transport.requests[1]['body']
+    assert repair['tools'] == original['tools']
+    assert repair['tool_choice'] == {'type': 'auto'}
+    assert repair['messages'][-1]['content'][:-1] == \
+        original['messages'][-1]['content']
+    reminder = repair['messages'][-1]['content'][-1]['text']
+    assert f'Use exactly one {tool} tool call' in reminder
+    assert 'API calls used: 1/3.' in reminder
+    actual_tools = [
+        item for item in model._history
+        if item.get('type') in ('function_call', 'function_call_output')
+    ]
+    reference_tools = [
+        item for item in reference._history
+        if item.get('type') in ('function_call', 'function_call_output')
+    ]
+    assert actual_tools == reference_tools
+    assert 'No tool call was returned' not in json.dumps(model._history)
+    assert 'Action call: 3/3.' in json.dumps(transport.requests[-1]['body'])
+    assert model._assistant_turns == reference._assistant_turns
+    model.predict_action(**inputs_fn(2))
+    assert len(transport.requests) == 3  # No request beyond the call budget.
+
+
+def test_end_turn_at_call_budget_does_not_retry(monkeypatch):
+    model = MiniMaxLiberoVLA(max_llm_calls=1)
+    monkeypatch.setenv(model.api_key_env, 'test-key')
+    transport = FakeTransport([{
+        'content': [{
+            'type': 'text',
+            'text': 'Moving now.'
+        }],
+        'stop_reason':
+        'end_turn',
+    }])
+    monkeypatch.setattr(model, '_http_post', transport)
+    actions = model.predict_action(**libero_inputs(0))
+    torch.testing.assert_close(actions, model._hold_actions())
+    assert model._action_generation_stopped
+    assert len(transport.requests) == model._llm_calls == 1
+
+
+@pytest.mark.parametrize('cls, tool, commands, inputs_fn', [
+    (MiniMaxLiberoVLA, 'move_to', MOVES, libero_inputs),
+    (MiniMaxRobocasaVLA, 'control_gr1', GR1_COMMANDS, robocasa_inputs),
+])
+def test_stopped_policy_preserves_control_state_and_resets_next_episode(
+        monkeypatch, cls, tool, commands, inputs_fn):
+    model = cls(max_llm_calls=5)
+    monkeypatch.setenv(model.api_key_env, 'test-key')
+    missing = {
+        'id': 'text-only',
+        'content': [{
+            'type': 'text',
+            'text': 'I am done.'
+        }],
+        'stop_reason': 'end_turn',
+    }
+    transport = FakeTransport([
+        native_reply('anthropic', 'before', tool, commands[-1]),
+        missing,
+        missing,
+        native_reply('anthropic', 'next-episode', tool, commands[0]),
+    ])
+    monkeypatch.setattr(model, '_http_post', transport)
+    model.predict_action(**inputs_fn(0))
+    inputs = inputs_fn(1)
+    if tool == 'control_gr1':
+        inputs['left_arm'] = np.arange(7) * 0.01
+        inputs['right_arm'] = -np.arange(7) * 0.02
+        inputs['waist'] = np.array([0.02, 0.03, -0.01])
+        expected = model._hold_robocasa_actions(inputs['left_arm'],
+                                                inputs['right_arm'],
+                                                inputs['waist'])
+    else:
+        expected = model._hold_actions()
+        assert torch.all(expected[..., :6] == 0)
+        assert torch.all(expected[..., 6] == 1)  # Keep the closed gripper.
+    torch.testing.assert_close(model.predict_action(**inputs), expected)
+    assert model._action_generation_stopped
+    assert model._llm_calls == 3
+    assert model.last_response_metadata['id'] == 'text-only'
+    assert model.last_response_metadata['response_text'] == 'I am done.'
+    torch.testing.assert_close(model.predict_action(**inputs), expected)
+    assert len(transport.requests) == 3
+    model.predict_action(**inputs_fn(0))  # Same task, a new trial.
+    assert not model._action_generation_stopped
+    assert len(transport.requests) == 4
+    assert model._llm_calls == 1
+    assert model.last_response_metadata['id'] == 'msg_next-episode'
+    assert 'before' not in model._assistant_turns
+
+
+@pytest.mark.parametrize('cls, inputs_fn', [
+    (OpenAILiberoVLA, libero_inputs),
+    (OpenAIRobocasaVLA, robocasa_inputs),
+])
+def test_openai_empty_responses_remain_errors(monkeypatch, cls, inputs_fn):
+    model = cls()
+    monkeypatch.setattr(model, '_post_json', lambda _: {'output': []})
+    with pytest.raises(RuntimeError, match='Expected exactly one'):
+        model.predict_action(**inputs_fn(0))
+    assert not model._action_generation_stopped
+
+
+def test_libero_runner_finishes_failed_episode_and_runs_next(
+        monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from fluxvla.engines import build_runner_from_cfg
+    from fluxvla.engines.runners import base_eval_runner
+    from fluxvla.engines.runners import libero_eval_runner as module
+
+    obs = {
+        'agentview_image': np.zeros((16, 16, 3), dtype=np.uint8),
+        'robot0_eye_in_hand_image': np.zeros((16, 16, 3), dtype=np.uint8),
+        'robot0_eef_pos': np.zeros(3),
+        'robot0_eef_quat': np.array([0, 0, 0, 1]),
+        'robot0_gripper_qpos': np.zeros(2),
+        'robot0_joint_pos': np.zeros(7),
+    }
+
+    class FakeEnv:
+        episodes = 0
+        closed = False
+
+        def reset(self):
+            self.episodes += 1
+
+        def set_init_state(self, _):
+            return obs.copy()
+
+        def step(self, action):
+            return obs.copy(), 0, self.episodes == 2, {}
+
+        def close(self):
+            self.closed = True
+
+    env = FakeEnv()
+    task = SimpleNamespace(language='put the bowl on the plate')
+    suite = SimpleNamespace(
+        n_tasks=1,
+        get_task=lambda _: task,
+        get_task_init_states=lambda _: [None, None])
+    monkeypatch.setattr(
+        module, '_get_libero_benchmark', lambda: SimpleNamespace(
+            get_benchmark_dict=lambda: {'libero_object': lambda: suite}))
+    monkeypatch.setattr(module, 'get_libero_env', lambda *args, **kwargs:
+                        (env, task.language))
+    monkeypatch.setattr(
+        base_eval_runner.overwatch, 'local_rank', lambda: 0, raising=False)
+    monkeypatch.setattr(
+        base_eval_runner.overwatch, 'distributed_state', None, raising=False)
+    monkeypatch.setattr(module.overwatch, 'rank', lambda: 0)
+    monkeypatch.setattr(module.overwatch, 'world_size', lambda: 1)
+    monkeypatch.setattr(module.torch.cuda, 'current_device', lambda: 'cpu')
+    for name in ('broadcast_object_list', 'all_reduce', 'barrier'):
+        monkeypatch.setattr(module.dist, name, lambda *args, **kwargs: None)
+    cfg = load_config(monkeypatch,
+                      'minimax_m31_flash_libero_object_inference.py')
+    cfg.eval.update(
+        task_ids=[0],
+        num_trials_per_task=2,
+        num_steps_wait=0,
+        max_steps=10,
+        resize_size=16,
+        output_dir=str(tmp_path),
+        save_rollout_videos=False,
+        save_multi_view_rollout_videos=False)
+    cfg.eval.dataset.resize_size = 16
+    runner_cfg = cfg.eval.copy()
+    runner_cfg.cfg, runner_cfg.ckpt_path = cfg, None
+    runner = build_runner_from_cfg(runner_cfg)
+    monkeypatch.setenv(runner.vla.api_key_env, 'test-key')
+    missing = {'content': [], 'stop_reason': 'end_turn'}
+    transport = FakeTransport([
+        missing,
+        missing,
+        native_reply('anthropic', 'second-episode', 'move_to', MOVES[0]),
+    ])
+    monkeypatch.setattr(runner.vla, '_http_post', transport)
+    runner.run()
+    assert env.closed and env.episodes == 2
+    assert len(transport.requests) == 3
+    assert runner.vla._llm_calls == 1
+    assert not runner.vla._action_generation_stopped
+    summary = json.loads((Path(runner.run_dir) / 'summary.json').read_text())
+    stats = summary['suite_stats']['libero_object']
+    assert stats['total_trials'] == 2
+    assert stats['total_successes'] == 1
+    task_result = json.loads((Path(runner.run_dir) / 'libero_object' /
+                              'task0_results.json').read_text())
+    assert task_result['failure_episodes'] == [0]
+    assert task_result['success_episodes'] == [1]
 
 
 @pytest.mark.parametrize('protocol, reply', [
@@ -761,8 +1024,8 @@ def test_robocasa_actions_match_openai_responses_policy(monkeypatch, protocol):
     model = MiniMaxRobocasaVLA(api_protocol=protocol)
     transport, actions = run_minimax(monkeypatch, model, 'control_gr1',
                                      GR1_COMMANDS, robocasa_inputs)
-    expected = run_reference(monkeypatch, OpenAIResponsesRobocasaVLA(),
-                             'control_gr1', GR1_COMMANDS, robocasa_inputs)
+    expected = run_reference(monkeypatch, OpenAIRobocasaVLA(), 'control_gr1',
+                             GR1_COMMANDS, robocasa_inputs)
 
     for got, want in zip(actions, expected):
         assert got.shape == (1, 8, 29)
