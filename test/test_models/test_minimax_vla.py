@@ -27,6 +27,7 @@ from mmengine import Config
 
 from fluxvla.engines import build_vla_from_cfg
 from fluxvla.models.vlas.minimax_vla import (MiniMaxLiberoVLA,
+                                             MiniMaxProtocolMixin,
                                              MiniMaxRobocasaVLA)
 from fluxvla.models.vlas.openai_vla import OpenAILiberoVLA, OpenAIRobocasaVLA
 
@@ -797,15 +798,19 @@ def fake_urlopen(monkeypatch, outcomes):
     from fluxvla.models.vlas import minimax_vla
     requests = []
 
-    def urlopen(request, timeout):
-        requests.append((request, timeout))
-        outcome = outcomes[len(requests) - 1]
-        if isinstance(outcome, int):
-            raise urllib.error.HTTPError(request.full_url, outcome, 'error',
-                                         {}, io.BytesIO(b'{"error": "busy"}'))
-        return FakeHTTPResponse(json.dumps(outcome).encode('utf-8'))
+    class FakeOpener:
 
-    monkeypatch.setattr(urllib.request, 'urlopen', urlopen)
+        def open(self, request, timeout=None):
+            requests.append((request, timeout))
+            outcome = outcomes[len(requests) - 1]
+            if isinstance(outcome, int):
+                raise urllib.error.HTTPError(request.full_url, outcome,
+                                             'error', {},
+                                             io.BytesIO(b'{"error": "busy"}'))
+            return FakeHTTPResponse(json.dumps(outcome).encode('utf-8'))
+
+    monkeypatch.setattr(minimax_vla.urllib.request, 'build_opener',
+                        lambda *args: FakeOpener())
     monkeypatch.setattr(minimax_vla.time, 'sleep', lambda _: None)
     return requests
 
@@ -1185,3 +1190,206 @@ def test_config_reads_gateway_settings_from_environment(monkeypatch):
         assert resolved_endpoints(model) == (
             'https://gateway.example/v1', 'https://gateway.example/anthropic',
             'GATEWAY_KEY')
+
+
+# ---- Self-hosted deployment ------------------------------------------------
+
+LOCAL_CONFIGS = [
+    'minimax_m31_flash_local_libero_inference.py',
+    'minimax_m31_flash_local_libero_10_inference.py',
+    'minimax_m31_flash_local_robocasa_inference.py',
+]
+
+
+def load_local_config(monkeypatch, name):
+    for env in ('MINIMAX_LOCAL_BASE_URL', 'MINIMAX_LOCAL_SERVED_MODEL_NAME',
+                'MINIMAX_LOCAL_API_KEY', 'MINIMAX_CN_API_KEY',
+                'MINIMAX_INTL_API_KEY'):
+        monkeypatch.delenv(env, raising=False)
+    return Config.fromfile(ROOT / 'configs/minimax' / name, lazy_import=False)
+
+
+def local_model(**kwargs):
+    """Build a policy pointed at a self-hosted server."""
+    options = dict(
+        api_protocol='chat_completions',
+        base_url='http://127.0.0.1:8000/v1',
+        anthropic_base_url='http://127.0.0.1:8000/v1',
+        allow_anonymous=True,
+        explicit_tool_choice=True)
+    options.update(kwargs)
+    return MiniMaxLiberoVLA(**options)
+
+
+@pytest.mark.parametrize('name', LOCAL_CONFIGS)
+def test_local_configs_target_a_self_hosted_server(monkeypatch, name):
+    cfg = load_local_config(monkeypatch, name)
+    model_cfg = cfg.inference_model
+
+    # A local server speaks the OpenAI-compatible protocol.
+    assert model_cfg.api_protocol == 'chat_completions'
+    assert model_cfg.base_url == 'http://127.0.0.1:8000/v1'
+    assert model_cfg.anthropic_base_url == 'http://127.0.0.1:8000/v1'
+    assert model_cfg.allow_anonymous is True
+    assert model_cfg.explicit_tool_choice is True
+    assert model_cfg.tool_choice == 'auto'
+    assert model_cfg.model == 'MiniMax-M3.1-Flash'
+    assert model_cfg.served_model_name == 'MiniMax-M3.1-Flash'
+    assert model_cfg.reasoning_effort == 'low'
+    assert model_cfg.max_output_tokens >= 8192
+    # The hosted key variables must not be consulted.
+    assert model_cfg.allow_anonymous is True
+    assert cfg.eval.model_family == 'minimax-m3.1-flash-local'
+    assert cfg.eval.requires_dataset_stats is False
+
+
+def test_local_config_reads_settings_from_environment(monkeypatch):
+    monkeypatch.setenv('MINIMAX_LOCAL_BASE_URL', 'http://127.0.0.1:9999/v1')
+    monkeypatch.setenv('MINIMAX_LOCAL_SERVED_MODEL_NAME', 'my-local-m3')
+    cfg = Config.fromfile(
+        ROOT / 'configs/minimax/minimax_m31_flash_local_libero_inference.py',
+        lazy_import=False)
+    assert cfg.inference_model.base_url == 'http://127.0.0.1:9999/v1'
+    assert cfg.inference_model.served_model_name == 'my-local-m3'
+
+
+def test_local_robocasa_config_keeps_the_hosted_task_list(monkeypatch):
+    cfg = load_local_config(monkeypatch,
+                            'minimax_m31_flash_local_robocasa_inference.py')
+    reference = Config.fromfile(
+        ROOT / 'configs/minimax/minimax_m31_flash_robocasa_inference.py',
+        lazy_import=False)
+    assert cfg.inference_model.type == 'MiniMaxRobocasaVLA'
+    assert cfg.eval.type == 'RobocasaEvalRunner'
+    assert cfg.eval.task_list == reference.eval.task_list
+    assert cfg.eval.action_keys == reference.eval.action_keys
+    assert (cfg.inference_model.action_horizon == cfg.eval.eval_chunk_size ==
+            reference.eval.eval_chunk_size)
+
+
+def test_local_model_builds_without_network(monkeypatch):
+    cfg = load_local_config(monkeypatch,
+                            'minimax_m31_flash_local_libero_inference.py')
+    model = build_eval_model(cfg)
+    assert isinstance(model, MiniMaxLiberoVLA)
+    assert model.allow_anonymous is True
+    assert model.api_protocol == 'chat_completions'
+    assert model.tools[0]['name'] == 'move_to'
+
+
+def test_local_request_needs_no_authorization_header(monkeypatch):
+    model = local_model()
+    monkeypatch.delenv('MINIMAX_LOCAL_API_KEY', raising=False)
+    transport = FakeTransport(
+        [native_reply('chat_completions', 'call_0', 'move_to', MOVES[0])])
+    monkeypatch.setattr(model, '_http_post', transport)
+
+    model.predict_action(**libero_inputs(0))
+
+    request = transport.requests[0]
+    assert request['url'] == 'http://127.0.0.1:8000/v1/chat/completions'
+    assert 'Authorization' not in request['headers']
+    assert request['headers']['Content-Type'] == 'application/json'
+
+
+def test_local_request_never_sends_a_hosted_api_key(monkeypatch):
+    """A self-hosted endpoint must not receive a hosted credential."""
+    model = local_model()
+    monkeypatch.setenv('MINIMAX_CN_API_KEY', 'hosted-cloud-key')
+    monkeypatch.setenv('MINIMAX_LOCAL_API_KEY', 'local-placeholder')
+    transport = FakeTransport(
+        [native_reply('chat_completions', 'call_0', 'move_to', MOVES[0])])
+    monkeypatch.setattr(model, '_http_post', transport)
+
+    model.predict_action(**libero_inputs(0))
+
+    # The anonymous mode reads no key variable at all.
+    assert 'Authorization' not in transport.requests[0]['headers']
+
+
+def test_missing_key_still_fails_without_allow_anonymous(monkeypatch):
+    model = local_model(allow_anonymous=False)
+    monkeypatch.delenv('MINIMAX_CN_API_KEY', raising=False)
+    monkeypatch.delenv('MINIMAX_INTL_API_KEY', raising=False)
+    with pytest.raises(RuntimeError, match='API key'):
+        model.predict_action(**libero_inputs(0))
+
+
+def test_served_model_name_overrides_the_request_model(monkeypatch):
+    model = local_model(served_model_name='my-local-m3')
+    transport, _ = run_minimax(monkeypatch, model, 'move_to', MOVES[:1],
+                               libero_inputs)
+    assert transport.requests[0]['body']['model'] == 'my-local-m3'
+
+
+def test_request_model_defaults_to_the_model_id(monkeypatch):
+    model = local_model()
+    transport, _ = run_minimax(monkeypatch, model, 'move_to', MOVES[:1],
+                               libero_inputs)
+    assert transport.requests[0]['body']['model'] == 'MiniMax-M3.1-Flash'
+
+
+def test_chat_completions_omits_tool_choice_by_default(monkeypatch):
+    model = MiniMaxLiberoVLA(api_protocol='chat_completions')
+    transport, _ = run_minimax(monkeypatch, model, 'move_to', MOVES[:1],
+                               libero_inputs)
+    body = transport.requests[0]['body']
+    # MiniMax's hosted reference does not document these fields.
+    assert 'tool_choice' not in body and 'parallel_tool_calls' not in body
+
+
+def test_explicit_tool_choice_is_sent_when_enabled(monkeypatch):
+    model = MiniMaxLiberoVLA(
+        api_protocol='chat_completions', explicit_tool_choice=True)
+    transport, _ = run_minimax(monkeypatch, model, 'move_to', MOVES[:1],
+                               libero_inputs)
+    body = transport.requests[0]['body']
+    # OpenAI-compatible servers default to tool_choice='none', which forbids
+    # tool calls, so 'auto' has to be sent explicitly.
+    assert body['tool_choice'] == 'auto'
+    assert body['parallel_tool_calls'] is False
+
+
+def test_required_tool_choice_still_overrides_auto(monkeypatch):
+    model = MiniMaxLiberoVLA(
+        api_protocol='chat_completions', tool_choice='required')
+    transport, _ = run_minimax(monkeypatch, model, 'move_to', MOVES[:1],
+                               libero_inputs)
+    assert transport.requests[0]['body']['tool_choice'] == 'required'
+
+
+def test_build_opener_disables_proxies_only_for_loopback(monkeypatch):
+    recorded = {}
+
+    def fake_build_opener(*args):
+        recorded['args'] = args
+        return 'opener'
+
+    monkeypatch.setattr(urllib.request, 'build_opener', fake_build_opener)
+
+    assert MiniMaxProtocolMixin._build_opener(
+        'http://127.0.0.1:8000/v1') == 'opener'
+    assert isinstance(recorded['args'][0], urllib.request.ProxyHandler)
+    assert recorded['args'][0].proxies == {}
+
+    assert MiniMaxProtocolMixin._build_opener(
+        'https://api.minimax.cn/v1') == 'opener'
+    assert recorded['args'] == ()
+
+
+def test_local_robocasa_actions_match_the_hosted_policy(monkeypatch):
+    """The self-hosted path must produce the same GR1 actions."""
+    local = MiniMaxRobocasaVLA(
+        api_protocol='chat_completions',
+        base_url='http://127.0.0.1:8000/v1',
+        anthropic_base_url='http://127.0.0.1:8000/v1',
+        api_key_env='MINIMAX_LOCAL_API_KEY',
+        allow_anonymous=True,
+        explicit_tool_choice=True)
+    _, local_actions = run_minimax(monkeypatch, local, 'control_gr1',
+                                   GR1_COMMANDS, robocasa_inputs)
+    expected = run_reference(monkeypatch, OpenAIRobocasaVLA(), 'control_gr1',
+                             GR1_COMMANDS, robocasa_inputs)
+
+    for got, want in zip(local_actions, expected):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)

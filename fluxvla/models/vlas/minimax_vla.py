@@ -60,6 +60,8 @@ TOOL_CHOICES = ('auto', 'required')
 _TRUNCATION_REASONS = ('max_tokens', 'length', 'max_output_tokens')
 # base_resp codes for timeouts, rate limits and internal errors.
 _RETRYABLE_STATUS_CODES = (1001, 1002, 1013)
+# Hosts that serve a self-hosted model and must bypass an HTTP proxy.
+LOCAL_HOSTS = ('localhost', '127.0.0.1', '::1', '0.0.0.0')
 
 
 class MiniMaxProtocolMixin:
@@ -99,6 +101,21 @@ class MiniMaxProtocolMixin:
         max_output_tokens (int): Generation cap. Thinking tokens count
             towards it and MiniMax-M3.1-Flash always thinks, so keep ample
             headroom above the size of one tool call.
+        served_model_name (str): Model name sent to the server. Defaults to
+            ``model``. A self-hosted server registers the name it was started
+            with, which is often a local path rather than the model id, so
+            this decouples the request from the checkpoint identifier.
+        allow_anonymous (bool): Send the request without an ``Authorization``
+            header when the API key is missing. A local inference server does
+            not authenticate requests, so the hosted key is unavailable for a
+            self-hosted deployment. Keep this ``False`` for the hosted
+            endpoints, which reject anonymous requests.
+        explicit_tool_choice (bool): Send ``tool_choice='auto'`` and
+            ``parallel_tool_calls`` over Chat Completions. MiniMax's own Chat
+            Completions reference does not document those fields, so they stay
+            off by default. OpenAI-compatible servers default to
+            ``tool_choice='none'``, which forbids tool calls, so a
+            self-hosted server needs this enabled.
     """
 
     def __init__(self,
@@ -113,6 +130,9 @@ class MiniMaxProtocolMixin:
                  reasoning_effort: Optional[str] = 'low',
                  max_output_tokens: Optional[int] = 16384,
                  image_detail: str = 'default',
+                 served_model_name: Optional[str] = None,
+                 allow_anonymous: bool = False,
+                 explicit_tool_choice: bool = False,
                  **kwargs) -> None:
         base_url, anthropic_base_url, api_key_env = self._resolve_region(
             region, base_url, anthropic_base_url, api_key_env)
@@ -145,6 +165,9 @@ class MiniMaxProtocolMixin:
         self.anthropic_base_url = anthropic_base_url.rstrip('/')
         self.tool_choice = tool_choice
         self.replay_assistant_turns = bool(replay_assistant_turns)
+        self.served_model_name = served_model_name or None
+        self.allow_anonymous = bool(allow_anonymous)
+        self.explicit_tool_choice = bool(explicit_tool_choice)
         self._assistant_turns: Dict[str, Any] = {}
 
     @staticmethod
@@ -199,7 +222,7 @@ class MiniMaxProtocolMixin:
     def _responses_body(self) -> Dict[str, Any]:
         # Keep provider-specific options out of the shared robot policy.
         body = {
-            'model': self.model,
+            'model': self.served_model_name or self.model,
             'input': self._compact_history(),
             'tools': self.tools,
             'tool_choice': 'auto',
@@ -271,7 +294,7 @@ class MiniMaxProtocolMixin:
                 raise RuntimeError(f'Unsupported history item: {item!r}')
         body = {
             'model':
-            self.model,
+            self.served_model_name or self.model,
             'messages':
             messages,
             'tools': [{
@@ -285,6 +308,16 @@ class MiniMaxProtocolMixin:
         }
         if self.tool_choice == 'required':
             body['tool_choice'] = 'required'
+        elif self.explicit_tool_choice:
+            # OpenAI-compatible servers default to ``tool_choice='none'``,
+            # which forbids tool calls entirely. Send ``'auto'`` explicitly so
+            # the model is allowed to emit the move_to / control_gr1 call.
+            # MiniMax's own Chat Completions reference does not document the
+            # field, so this stays opt-in.
+            body['tool_choice'] = 'auto'
+            # Ask for a single tool call; a server may otherwise return
+            # several, which the inherited single-call validation rejects.
+            body['parallel_tool_calls'] = False
         if self.reasoning_effort is not None:
             body['reasoning_effort'] = self.reasoning_effort
         if self.max_output_tokens is not None:
@@ -346,7 +379,7 @@ class MiniMaxProtocolMixin:
                 raise RuntimeError(f'Unsupported history item: {item!r}')
         body = {
             'model':
-            self.model,
+            self.served_model_name or self.model,
             'max_tokens':
             self.max_output_tokens,
             'messages':
@@ -395,16 +428,17 @@ class MiniMaxProtocolMixin:
     # ---- Transport and response normalization ---------------------------
 
     def _post_json(self, body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        api_key = os.environ.get(self.api_key_env)
-        if not api_key:
-            raise RuntimeError(
-                f'Missing MiniMax {self.region!r} API key: set the '
-                f'environment variable {self.api_key_env!r}.')
         headers = {
-            'Authorization': f'Bearer {api_key}',
             'Content-Type': 'application/json',
             'User-Agent': f'FluxVLA/{type(self).__name__}',
         }
+        if not self.allow_anonymous:
+            api_key = os.environ.get(self.api_key_env)
+            if not api_key:
+                raise RuntimeError(
+                    f'Missing MiniMax {self.region!r} API key: set the '
+                    f'environment variable {self.api_key_env!r}.')
+            headers['Authorization'] = f'Bearer {api_key}'
         if self.api_protocol == 'anthropic':
             start = time.monotonic()
             for attempt in range(2):
@@ -483,10 +517,11 @@ class MiniMaxProtocolMixin:
             data=json.dumps(body).encode('utf-8'),
             headers=headers,
             method='POST')
+        opener = self._build_opener(url)
         for attempt in range(self.max_retries + 1):
             last_attempt = attempt >= self.max_retries
             try:
-                with urllib.request.urlopen(
+                with opener.open(
                         request, timeout=self.request_timeout) as response:
                     raw = json.loads(response.read().decode('utf-8'))
                 status = (raw.get('base_resp') or {}).get('status_code')
@@ -504,6 +539,20 @@ class MiniMaxProtocolMixin:
                         f'{api_name} request failed: {exc}') from exc
             time.sleep(self.retry_backoff * (2**attempt))
         raise AssertionError('unreachable')
+
+    @staticmethod
+    def _build_opener(url: str) -> urllib.request.OpenerDirector:
+        """Return an opener that reaches a loopback server directly.
+
+        A self-hosted inference server listens on localhost, but an
+        ``http_proxy`` in the environment would otherwise be used for it and
+        fail with a proxy error. Proxies are kept for every other host, so
+        the hosted endpoints still work behind a corporate proxy.
+        """
+        host = (urlsplit(url).hostname or '').lower()
+        if host not in LOCAL_HOSTS:
+            return urllib.request.build_opener()
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     @staticmethod
     def _raise_api_error(raw: Dict[str, Any]) -> None:
